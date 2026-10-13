@@ -1,7 +1,7 @@
 use clap::Parser;
 use env_logger::Env;
 use log::{self, error, info, warn};
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashMap};
 use std::sync::{
     Arc, Mutex,
     atomic::{AtomicBool, Ordering},
@@ -209,6 +209,101 @@ fn rtp_carries_media(bytes: &[u8]) -> bool {
     bytes.len() >= 12 && (bytes[0] & 0x20 == 0 || bytes[1] & 0x80 != 0)
 }
 
+/// How long the bridged video track must have been silent before another track that carries media
+/// takes over. Long enough that two senders arriving at once cannot make the output flap between
+/// them, short enough that a re-slotted publisher costs about a second of frozen picture.
+const VIDEO_SWITCH_AFTER: Duration = Duration::from_millis(1000);
+
+/// What the selection probe should do with one buffer on one video pad.
+#[derive(Debug, PartialEq, Eq)]
+enum VideoVerdict {
+    /// The pad is the bridged one: let the buffer through.
+    Pass,
+    /// Not the bridged pad, or not yet proven to carry media: drop it before it reaches anything.
+    Drop,
+    /// This pad takes over as the bridged one. `previous` is the pad it replaces, if any.
+    Activate { previous: Option<String> },
+}
+
+/// Chooses which incoming video track feeds the output, and follows the publisher when the SFU
+/// moves it onto a different SSRC.
+///
+/// The SFU (Symphony Media Bridge, ssrc-rewrite relay) gives each forwarded publisher an outbound
+/// SSRC from a pool, and any reconfigure of that publisher's endpoint returns its SSRC to the pool
+/// and takes a different one (`EngineMixer::reconfigureVideoStream` removes and re-adds the video
+/// participant even when nothing changed). In NeoCom that happens whenever the publisher's own
+/// browser changes a video pin, which it does automatically when a WHIP feed joins the line. The
+/// same camera then arrives on a new webrtcbin pad, and the old pad goes silent for good.
+///
+/// This used to be first-track-wins with every later track sent to a fakesink, so the output froze
+/// on the last frame for the rest of the session while audio carried on. Now a later track takes
+/// over once the bridged one has been silent for `VIDEO_SWITCH_AFTER`. While the bridged track is
+/// alive the rule is unchanged: other tracks, such as further senders under forward-all, are
+/// dropped, so the output does not flap between them.
+#[derive(Default)]
+struct VideoSelector {
+    /// Pad currently feeding the output.
+    active: Option<String>,
+    /// Last time each pad carried real media (see rtp_carries_media).
+    last_media: HashMap<String, Instant>,
+    /// Pads that already have a decode chain, so taking them back needs no new one.
+    chained: Vec<String>,
+    /// Pad whose compositor input is currently visible, and each chained pad's compositor input.
+    shown: Option<String>,
+    comp_pads: Vec<(String, gst::Pad)>,
+}
+
+impl VideoSelector {
+    fn on_buffer(&mut self, pad: &str, carries_media: bool, now: Instant) -> VideoVerdict {
+        if carries_media {
+            self.last_media.insert(pad.to_owned(), now);
+        }
+        if self.active.as_deref() == Some(pad) {
+            return VideoVerdict::Pass;
+        }
+        // An unproven buffer never takes over: padding-only probing streams must not win.
+        if !carries_media {
+            return VideoVerdict::Drop;
+        }
+        let active_silent = match self.active.as_deref() {
+            None => true,
+            Some(active) => self
+                .last_media
+                .get(active)
+                .is_none_or(|last| now.duration_since(*last) >= VIDEO_SWITCH_AFTER),
+        };
+        if !active_silent {
+            return VideoVerdict::Drop;
+        }
+        let previous = self.active.replace(pad.to_owned());
+        VideoVerdict::Activate { previous }
+    }
+
+    /// Records that `pad` now has a decode chain. Returns false if it already had one.
+    fn mark_chained(&mut self, pad: &str) -> bool {
+        if self.chained.iter().any(|p| p == pad) {
+            return false;
+        }
+        self.chained.push(pad.to_owned());
+        true
+    }
+
+    /// Called for each decoded frame of `pad`'s chain. The first decoded frame of the active pad
+    /// makes it the visible compositor input and hides the others, so the old track's last frame
+    /// stays up until the new one has a picture rather than flashing black in between.
+    fn on_decoded_frame(&mut self, pad: &str) {
+        if self.active.as_deref() != Some(pad) || self.shown.as_deref() == Some(pad) {
+            return;
+        }
+        for (name, comp_pad) in &self.comp_pads {
+            comp_pad.set_property("alpha", if name == pad { 1.0f64 } else { 0.0f64 });
+        }
+        if let Some(previous) = self.shown.replace(pad.to_owned()) {
+            info!("video output now shows '{pad}' (was '{previous}')");
+        }
+    }
+}
+
 /// Build an RTCP REMB packet (draft-alvestrand-rmcat-remb) advertising `bitrate_bps` as the
 /// receiver's available bandwidth for `media_ssrcs`.
 ///
@@ -395,8 +490,8 @@ fn main() {
     mixer.set_property_from_str("min-upstream-latency", &format!("{latency}000000"));
     let mixer_clone = mixer.clone();
 
-    // Guard: only the first arriving video pad is bridged; additional video tracks go to fakesink.
-    let video_bridged = Arc::new(AtomicBool::new(false));
+    // Which video pad feeds the output. See VideoSelector.
+    let video_selector = Arc::new(Mutex::new(VideoSelector::default()));
 
     let input_whep_bin = pipeline
         .by_name("input")
@@ -618,7 +713,7 @@ fn main() {
 
         let pipeline_clone = pipeline_clone.clone();
         let mixer_clone = mixer_clone.clone();
-        let video_bridged = video_bridged.clone();
+        let video_selector = Arc::clone(&video_selector);
 
         let probe_logged = AtomicBool::new(false);
         let observed_ssrcs = Arc::clone(&observed_ssrcs_for_probe);
@@ -741,23 +836,40 @@ fn main() {
                     // padding-only stream the SFU also sends (see rtp_carries_media). Bridging the
                     // padding stream produces an SRT output with no video track at all — decodebin
                     // never negotiates caps for it — and no error anywhere to explain why.
-                    if bridge_video && !media_evidence {
-                        return gstreamer::PadProbeReturn::Drop;
+                    //
+                    // This probe stays installed for the life of the pad when bridging: it is also
+                    // what lets a later track take over from a silent one (see VideoSelector).
+                    let pad_name = pad.name().to_string();
+                    if bridge_video {
+                        let verdict = video_selector.lock().unwrap().on_buffer(
+                            &pad_name,
+                            media_evidence,
+                            Instant::now(),
+                        );
+                        match verdict {
+                            VideoVerdict::Pass => return gstreamer::PadProbeReturn::Ok,
+                            VideoVerdict::Drop => return gstreamer::PadProbeReturn::Drop,
+                            VideoVerdict::Activate { previous } => {
+                                if let Some(previous) = previous {
+                                    info!(
+                                        "video track '{previous}' silent for {}ms, switching the \
+                                         output to '{pad_name}'",
+                                        VIDEO_SWITCH_AFTER.as_millis()
+                                    );
+                                }
+                                if !video_selector.lock().unwrap().mark_chained(&pad_name) {
+                                    // Taking back a pad that was bridged before: its chain and
+                                    // compositor input are still there.
+                                    return gstreamer::PadProbeReturn::Ok;
+                                }
+                            }
+                        }
                     }
 
-                    // First video track that proved itself wins; later ones go to fakesink.
-                    // video_bridged.swap returns the *previous* value, so the first caller gets false
-                    // and proceeds to bridge; all subsequent callers get true and use fakesink.
-                    // AcqRel is sufficient: we only need to synchronise this flag, not other memory.
-                    if !bridge_video || video_bridged.swap(true, Ordering::AcqRel) {
+                    if !bridge_video {
                         info!(
-                            "discarding video pad '{}' to fakesink ({})",
-                            pad.name(),
-                            if bridge_video {
-                                "another video track was already bridged"
-                            } else {
-                                "video bridging disabled"
-                            }
+                            "discarding video pad '{}' to fakesink (video bridging disabled)",
+                            pad.name()
                         );
                         let pipe_bin = pipeline_clone
                             .dynamic_cast_ref::<gst::Bin>()
@@ -797,6 +909,8 @@ fn main() {
                         // pipe_bin borrow must end before pipeline_clone.clone() — NLL handles this.
                         let pipe_bin_clone = pipe_bin.clone();
                         let pipeline_for_comp = pipeline_clone.clone();
+                        let selector_for_comp = Arc::clone(&video_selector);
+                        let pad_name_for_comp = pad_name.clone();
 
                         // Set once decodebin has actually produced decoded video, which is the
                         // condition the keyframe retry below waits on.
@@ -851,13 +965,29 @@ fn main() {
                                 .expect("could not request a compositor pad for the real video");
                             // Above the black fill, which holds sink_0 at the default zorder 0.
                             comp_pad.set_property("zorder", 1u32);
+                            // Hidden until this track decodes a frame while it is the active one,
+                            // so a takeover never flashes black (see on_decoded_frame).
+                            comp_pad.set_property("alpha", 0.0f64);
                             info!(
-                                "mixing real video onto compositor pad '{}' ({video_width}x{video_height})",
+                                "mixing real video from '{pad_name_for_comp}' onto compositor pad '{}' ({video_width}x{video_height})",
                                 comp_pad.name()
                             );
-                            queue
-                                .static_pad("src")
+                            selector_for_comp
+                                .lock()
                                 .unwrap()
+                                .comp_pads
+                                .push((pad_name_for_comp.clone(), comp_pad.clone()));
+                            let queue_src = queue.static_pad("src").unwrap();
+                            let selector_for_frames = Arc::clone(&selector_for_comp);
+                            let pad_name_for_frames = pad_name_for_comp.clone();
+                            queue_src.add_probe(PadProbeType::BUFFER, move |_pad, _info| {
+                                selector_for_frames
+                                    .lock()
+                                    .unwrap()
+                                    .on_decoded_frame(&pad_name_for_frames);
+                                gstreamer::PadProbeReturn::Ok
+                            });
+                            queue_src
                                 .link(&comp_pad)
                                 .expect("could not link video queue src to compositor");
 
@@ -902,6 +1032,9 @@ fn main() {
                                 );
                             }
                         });
+
+                        // Keep the selection probe: removing it would freeze the choice again.
+                        return gstreamer::PadProbeReturn::Ok;
                     }
                 }
                 _ => {
@@ -1059,6 +1192,127 @@ fn debug_pipeline(pipe: &gst::Bin, str: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn ms(base: Instant, millis: u64) -> Instant {
+        base + Duration::from_millis(millis)
+    }
+
+    #[test]
+    fn first_track_with_media_is_bridged() {
+        let mut sel = VideoSelector::default();
+        let t0 = Instant::now();
+        assert_eq!(
+            sel.on_buffer("video_src_0", true, t0),
+            VideoVerdict::Activate { previous: None }
+        );
+        assert_eq!(
+            sel.on_buffer("video_src_0", true, ms(t0, 20)),
+            VideoVerdict::Pass
+        );
+    }
+
+    #[test]
+    fn padding_only_track_never_takes_over() {
+        let mut sel = VideoSelector::default();
+        let t0 = Instant::now();
+        assert_eq!(sel.on_buffer("video_src_9", false, t0), VideoVerdict::Drop);
+        assert_eq!(
+            sel.on_buffer("video_src_0", true, ms(t0, 10)),
+            VideoVerdict::Activate { previous: None }
+        );
+        // Long after the real track went quiet, padding alone still does not win.
+        assert_eq!(
+            sel.on_buffer("video_src_9", false, ms(t0, 60_000)),
+            VideoVerdict::Drop
+        );
+    }
+
+    #[test]
+    fn second_track_is_dropped_while_the_first_is_alive() {
+        let mut sel = VideoSelector::default();
+        let t0 = Instant::now();
+        sel.on_buffer("video_src_0", true, t0);
+        for i in 1..100 {
+            assert_eq!(
+                sel.on_buffer("video_src_0", true, ms(t0, i * 20)),
+                VideoVerdict::Pass
+            );
+            assert_eq!(
+                sel.on_buffer("video_src_2", true, ms(t0, i * 20 + 5)),
+                VideoVerdict::Drop
+            );
+        }
+    }
+
+    #[test]
+    fn reslotted_publisher_takes_over_once_the_old_track_is_silent() {
+        // The freeze this fixes: the SFU moves the camera to a new SSRC, the old pad goes silent.
+        let mut sel = VideoSelector::default();
+        let t0 = Instant::now();
+        sel.on_buffer("video_src_0", true, t0);
+        assert_eq!(
+            sel.on_buffer("video_src_2", true, ms(t0, 999)),
+            VideoVerdict::Drop
+        );
+        assert_eq!(
+            sel.on_buffer("video_src_2", true, ms(t0, 1000)),
+            VideoVerdict::Activate {
+                previous: Some("video_src_0".into())
+            }
+        );
+        assert_eq!(
+            sel.on_buffer("video_src_2", true, ms(t0, 1020)),
+            VideoVerdict::Pass
+        );
+        // The old pad coming back while the new one is alive is now the one dropped.
+        assert_eq!(
+            sel.on_buffer("video_src_0", true, ms(t0, 1030)),
+            VideoVerdict::Drop
+        );
+    }
+
+    #[test]
+    fn padding_on_the_active_track_does_not_keep_it_alive() {
+        let mut sel = VideoSelector::default();
+        let t0 = Instant::now();
+        sel.on_buffer("video_src_0", true, t0);
+        // Still passed through, but it does not count as media.
+        assert_eq!(
+            sel.on_buffer("video_src_0", false, ms(t0, 900)),
+            VideoVerdict::Pass
+        );
+        assert_eq!(
+            sel.on_buffer("video_src_2", true, ms(t0, 1000)),
+            VideoVerdict::Activate {
+                previous: Some("video_src_0".into())
+            }
+        );
+    }
+
+    #[test]
+    fn a_pad_is_chained_only_once() {
+        let mut sel = VideoSelector::default();
+        assert!(sel.mark_chained("video_src_0"));
+        assert!(sel.mark_chained("video_src_2"));
+        assert!(!sel.mark_chained("video_src_0"));
+    }
+
+    #[test]
+    fn only_the_active_track_becomes_visible() {
+        let mut sel = VideoSelector::default();
+        let t0 = Instant::now();
+        sel.on_buffer("video_src_0", true, t0);
+        sel.on_decoded_frame("video_src_0");
+        assert_eq!(sel.shown.as_deref(), Some("video_src_0"));
+        // A late frame from a track that is not active must not steal the picture.
+        sel.on_decoded_frame("video_src_2");
+        assert_eq!(sel.shown.as_deref(), Some("video_src_0"));
+        sel.on_buffer("video_src_2", true, ms(t0, 1500));
+        // Switched, but the old picture stays up until the new track has decoded a frame.
+        assert_eq!(sel.shown.as_deref(), Some("video_src_0"));
+        sel.on_decoded_frame("video_src_2");
+        assert_eq!(sel.shown.as_deref(), Some("video_src_2"));
+    }
 
     #[test]
     fn video_defaults_suit_a_50hz_plant() {
