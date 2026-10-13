@@ -214,6 +214,12 @@ fn rtp_carries_media(bytes: &[u8]) -> bool {
 /// them, short enough that a re-slotted publisher costs about a second of frozen picture.
 const VIDEO_SWITCH_AFTER: Duration = Duration::from_millis(1000);
 
+/// How far before the bridged track's last packet a successor may have started and still count
+/// as its continuation. A re-slot moves the publisher in one step, so the new SSRC's first packet
+/// lands within a few packet intervals of the old one's last; this only absorbs jitter and
+/// reordering between the two.
+const VIDEO_TAKEOVER_MARGIN: Duration = Duration::from_millis(250);
+
 /// What the selection probe should do with one buffer on one video pad.
 #[derive(Debug, PartialEq, Eq)]
 enum VideoVerdict {
@@ -246,6 +252,9 @@ struct VideoSelector {
     active: Option<String>,
     /// Last time each pad carried real media (see rtp_carries_media).
     last_media: HashMap<String, Instant>,
+    /// When each pad's current run of media began: its first media, or its first media after a
+    /// silence of at least `VIDEO_SWITCH_AFTER` (the SFU reuses SSRCs, so a pad can come back).
+    run_start: HashMap<String, Instant>,
     /// SSRC each pad's media arrives on, which is what a keyframe request has to name.
     ssrcs: HashMap<String, u32>,
     /// Pads that already have a decode chain, so taking them back needs no new one.
@@ -264,6 +273,13 @@ impl VideoSelector {
         now: Instant,
     ) -> VideoVerdict {
         if carries_media {
+            let resumed = self
+                .last_media
+                .get(pad)
+                .is_none_or(|last| now.duration_since(*last) >= VIDEO_SWITCH_AFTER);
+            if resumed {
+                self.run_start.insert(pad.to_owned(), now);
+            }
             self.last_media.insert(pad.to_owned(), now);
             if let Some(ssrc) = ssrc {
                 self.ssrcs.insert(pad.to_owned(), ssrc);
@@ -276,14 +292,43 @@ impl VideoSelector {
         if !carries_media {
             return VideoVerdict::Drop;
         }
-        let active_silent = match self.active.as_deref() {
-            None => true,
-            Some(active) => self
-                .last_media
-                .get(active)
-                .is_none_or(|last| now.duration_since(*last) >= VIDEO_SWITCH_AFTER),
+        let Some(active) = self.active.as_deref() else {
+            // Nothing bridged yet: the first track to prove itself wins, as before.
+            self.active = Some(pad.to_owned());
+            return VideoVerdict::Activate { previous: None };
         };
-        if !active_silent {
+        let Some(active_last) = self.last_media.get(active).copied() else {
+            return VideoVerdict::Drop;
+        };
+        if now.duration_since(active_last) < VIDEO_SWITCH_AFTER {
+            return VideoVerdict::Drop;
+        }
+        // Only a continuation of the silent track may take over, and the earliest one wins.
+        //
+        // Without a WHEP source pin the SFU forwards every publisher, so a second sender (a WHIP
+        // return feed, typically) can be arriving on its own pad, dropped here, at the moment the
+        // bridged publisher is re-slotted. Taking whichever track sends next would then put that
+        // other sender on air — for a return feed, program fed back into program. A re-slotted
+        // publisher starts its new run as the old one stops; a sender that was already running
+        // while the old track was alive cannot be its continuation, and a sender that joins later
+        // starts later than the publisher's new SSRC does. If no track qualifies, the output stays
+        // on the last frame: a freeze is the safer failure on air than the wrong picture.
+        let cutoff = active_last
+            .checked_sub(VIDEO_TAKEOVER_MARGIN)
+            .unwrap_or(active_last);
+        let successor = self
+            .run_start
+            .iter()
+            .filter(|(p, _)| p.as_str() != active)
+            .filter(|(_, start)| **start >= cutoff)
+            .filter(|(p, _)| {
+                self.last_media
+                    .get(p.as_str())
+                    .is_some_and(|last| now.duration_since(*last) < VIDEO_SWITCH_AFTER)
+            })
+            .min_by_key(|(p, start)| (**start, p.as_str()))
+            .map(|(p, _)| p.clone());
+        if successor.as_deref() != Some(pad) {
             return VideoVerdict::Drop;
         }
         let previous = self.active.replace(pad.to_owned());
@@ -1357,6 +1402,101 @@ mod tests {
         assert_eq!(
             sel.on_buffer("video_src_0", true, Some(4096), ms(t0, 1030)),
             VideoVerdict::Drop
+        );
+    }
+
+    #[test]
+    fn a_sender_already_running_never_replaces_a_reslotted_publisher() {
+        // Unpinned WHEP: the return feed arrives on its own pad and is dropped while the camera is
+        // alive. Then the camera is re-slotted. Only the camera's new pad may take over, even when
+        // the return feed's packet is the first to arrive after the silence.
+        let mut sel = VideoSelector::default();
+        let t0 = Instant::now();
+        sel.on_buffer("video_src_0", true, Some(1), t0); // camera
+        for i in 1..=50 {
+            let t = ms(t0, i * 20);
+            sel.on_buffer("video_src_0", true, Some(1), t);
+            assert_eq!(
+                sel.on_buffer("video_src_1", true, Some(2), ms(t0, i * 20 + 5)),
+                VideoVerdict::Drop
+            );
+        }
+        // Camera's last packet on the old SSRC at 1000ms; its new SSRC starts at 1010ms.
+        for i in 0..60 {
+            let t = 1010 + i * 20;
+            let return_feed = sel.on_buffer("video_src_1", true, Some(2), ms(t0, t));
+            let camera = sel.on_buffer("video_src_2", true, Some(3), ms(t0, t + 3));
+            assert_ne!(
+                return_feed,
+                VideoVerdict::Activate {
+                    previous: Some("video_src_0".into())
+                }
+            );
+            if t + 3 >= 2000 {
+                assert_eq!(sel.active.as_deref(), Some("video_src_2"));
+                let _ = camera;
+            }
+        }
+        assert_eq!(sel.active.as_deref(), Some("video_src_2"));
+    }
+
+    #[test]
+    fn the_earliest_new_run_wins_when_several_start_after_the_silence() {
+        let mut sel = VideoSelector::default();
+        let t0 = Instant::now();
+        sel.on_buffer("video_src_0", true, Some(1), t0);
+        // Camera re-slotted at 20ms; a WHIP feed starts 400ms later, both keep sending.
+        for t in (20..=1600).step_by(20) {
+            sel.on_buffer("video_src_2", true, Some(3), ms(t0, t));
+            if t >= 420 {
+                sel.on_buffer("video_src_3", true, Some(4), ms(t0, t + 1));
+            }
+        }
+        assert_eq!(sel.active.as_deref(), Some("video_src_2"));
+    }
+
+    #[test]
+    fn output_stays_frozen_when_the_only_other_sender_was_already_running() {
+        // The bridged publisher leaves for good; the return feed has been there all along.
+        let mut sel = VideoSelector::default();
+        let t0 = Instant::now();
+        sel.on_buffer("video_src_0", true, Some(1), t0);
+        sel.on_buffer("video_src_1", true, Some(2), ms(t0, 5));
+        for t in (20..=500).step_by(20) {
+            sel.on_buffer("video_src_0", true, Some(1), ms(t0, t));
+            sel.on_buffer("video_src_1", true, Some(2), ms(t0, t + 5));
+        }
+        for t in (520..=5000).step_by(20) {
+            assert_eq!(
+                sel.on_buffer("video_src_1", true, Some(2), ms(t0, t)),
+                VideoVerdict::Drop
+            );
+        }
+        assert_eq!(sel.active.as_deref(), Some("video_src_0"));
+    }
+
+    #[test]
+    fn a_reused_pad_counts_as_a_new_run() {
+        // The SFU's SSRC pool can hand the publisher an SSRC (and so a pad) it used before.
+        let mut sel = VideoSelector::default();
+        let t0 = Instant::now();
+        sel.on_buffer("video_src_0", true, Some(1), t0);
+        sel.on_buffer("video_src_0", true, Some(1), ms(t0, 100));
+        sel.on_buffer("video_src_2", true, Some(3), ms(t0, 110));
+        assert_eq!(
+            sel.on_buffer("video_src_2", true, Some(3), ms(t0, 1200)),
+            VideoVerdict::Activate {
+                previous: Some("video_src_0".into())
+            }
+        );
+        // Re-slotted back onto the first pad.
+        sel.on_buffer("video_src_2", true, Some(3), ms(t0, 3000));
+        sel.on_buffer("video_src_0", true, Some(1), ms(t0, 3010));
+        assert_eq!(
+            sel.on_buffer("video_src_0", true, Some(1), ms(t0, 4100)),
+            VideoVerdict::Activate {
+                previous: Some("video_src_2".into())
+            }
         );
     }
 
