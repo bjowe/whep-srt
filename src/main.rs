@@ -246,6 +246,8 @@ struct VideoSelector {
     active: Option<String>,
     /// Last time each pad carried real media (see rtp_carries_media).
     last_media: HashMap<String, Instant>,
+    /// SSRC each pad's media arrives on, which is what a keyframe request has to name.
+    ssrcs: HashMap<String, u32>,
     /// Pads that already have a decode chain, so taking them back needs no new one.
     chained: Vec<String>,
     /// Pad whose compositor input is currently visible, and each chained pad's compositor input.
@@ -254,9 +256,18 @@ struct VideoSelector {
 }
 
 impl VideoSelector {
-    fn on_buffer(&mut self, pad: &str, carries_media: bool, now: Instant) -> VideoVerdict {
+    fn on_buffer(
+        &mut self,
+        pad: &str,
+        carries_media: bool,
+        ssrc: Option<u32>,
+        now: Instant,
+    ) -> VideoVerdict {
         if carries_media {
             self.last_media.insert(pad.to_owned(), now);
+            if let Some(ssrc) = ssrc {
+                self.ssrcs.insert(pad.to_owned(), ssrc);
+            }
         }
         if self.active.as_deref() == Some(pad) {
             return VideoVerdict::Pass;
@@ -277,6 +288,20 @@ impl VideoSelector {
         }
         let previous = self.active.replace(pad.to_owned());
         VideoVerdict::Activate { previous }
+    }
+
+    /// The SSRC to ask the SFU for a keyframe on, if the active track has not shown a picture yet.
+    ///
+    /// Covers both a takeover and the very first track of a session: in either case the SFU has
+    /// just created an outbound context for this bridge and forwards mid-GOP P-frames without
+    /// asking the publisher for a keyframe, so nothing decodes until the publisher's next natural
+    /// IDR — measured at 120s with a Chrome publisher.
+    fn keyframe_request(&self) -> Option<u32> {
+        let active = self.active.as_deref()?;
+        if self.shown.as_deref() == Some(active) {
+            return None;
+        }
+        self.ssrcs.get(active).copied()
     }
 
     /// Records that `pad` now has a decode chain. Returns false if it already had one.
@@ -302,6 +327,23 @@ impl VideoSelector {
             info!("video output now shows '{pad}' (was '{previous}')");
         }
     }
+}
+
+/// Build an RTCP Picture Loss Indication (RFC 4585 §6.3.1) asking the sender of `media_ssrc` for a
+/// keyframe.
+///
+/// GStreamer's own keyframe requests (an upstream force-key-unit event, or rtph264depay's
+/// request-keyframe) reach the SFU with a media SSRC of 0 here, and Symphony Media Bridge drops
+/// those: it finds the publisher through the outbound SSRC this bridge receives
+/// (`EngineMixer::processIncomingPayloadSpecificRtcpPacket`), so the request must name exactly
+/// that SSRC.
+fn build_pli(sender_ssrc: u32, media_ssrc: u32) -> Vec<u8> {
+    let mut packet = Vec::with_capacity(12);
+    // V=2, P=0, FMT=1 (PLI); PT=206 (payload-specific feedback); length 2 = three words minus one.
+    packet.extend_from_slice(&[0x81, 206, 0, 2]);
+    packet.extend_from_slice(&sender_ssrc.to_be_bytes());
+    packet.extend_from_slice(&media_ssrc.to_be_bytes());
+    packet
 }
 
 /// Build an RTCP REMB packet (draft-alvestrand-rmcat-remb) advertising `bitrate_bps` as the
@@ -546,6 +588,7 @@ fn main() {
     let observed_ssrcs: Arc<Mutex<BTreeSet<u32>>> = Arc::new(Mutex::new(BTreeSet::new()));
     let observed_ssrcs_for_remb = Arc::clone(&observed_ssrcs);
     let observed_ssrcs_for_probe = Arc::clone(&observed_ssrcs);
+    let selector_for_rtcp = Arc::clone(&video_selector);
 
     pipeline.connect_deep_element_added(move |pipe, bin, elem| {
         let elem_type = elem.type_().to_string();
@@ -565,22 +608,34 @@ fn main() {
             //
             // Appending is safe without parsing: an RTCP compound packet is just concatenated
             // packets, so a well-formed REMB placed after the existing ones is still valid.
-            if let Some(kbps) = remb_kbps {
+            //
+            // The same hook carries keyframe requests while a bridged video track has not decoded
+            // yet; see build_pli and VideoSelector::keyframe_request.
+            if remb_kbps.is_some() || bridge_video {
                 let observed_ssrcs = Arc::clone(&observed_ssrcs_for_remb);
+                let selector = Arc::clone(&selector_for_rtcp);
                 elem.connect_pad_added(move |_bin, pad| {
                     if !pad.name().starts_with("send_rtcp_src") {
                         return;
                     }
-                    info!(
-                        "[remb] advertising {kbps} kbps to the SFU on pad '{}'",
-                        pad.name()
-                    );
+                    if let Some(kbps) = remb_kbps {
+                        info!(
+                            "[remb] advertising {kbps} kbps to the SFU on pad '{}'",
+                            pad.name()
+                        );
+                    }
                     let observed_ssrcs = Arc::clone(&observed_ssrcs);
+                    let selector = Arc::clone(&selector);
                     let logged = AtomicBool::new(false);
+                    let last_pli_ssrc = Mutex::new(None::<u32>);
                     pad.add_probe(PadProbeType::BUFFER, move |_pad, probe_info| {
                         let Some(gst::PadProbeData::Buffer(ref buffer)) = probe_info.data else {
                             return gst::PadProbeReturn::Ok;
                         };
+                        let pli_ssrc = selector.lock().unwrap().keyframe_request();
+                        if remb_kbps.is_none() && pli_ssrc.is_none() {
+                            return gst::PadProbeReturn::Ok;
+                        }
                         // Sent with an empty SSRC list until media arrives. Waiting for a known
                         // SSRC would deadlock: the SFU forwards nothing until it hears an
                         // estimate, so no SSRC would ever be observed to name in the report.
@@ -602,6 +657,32 @@ fn main() {
                             existing[6],
                             existing[7],
                         ]);
+                        let mut extra = Vec::new();
+                        if let Some(media_ssrc) = pli_ssrc {
+                            let mut last = last_pli_ssrc.lock().unwrap();
+                            if *last != Some(media_ssrc) {
+                                info!(
+                                    "[pli] requesting a keyframe for ssrc {media_ssrc:#010x} \
+                                     (repeated with each RTCP until it decodes)"
+                                );
+                                *last = Some(media_ssrc);
+                            }
+                            extra.extend_from_slice(&build_pli(sender_ssrc, media_ssrc));
+                        }
+                        let Some(kbps) = remb_kbps else {
+                            let mut combined = Vec::with_capacity(existing.len() + extra.len());
+                            combined.extend_from_slice(existing);
+                            combined.extend_from_slice(&extra);
+                            drop(map);
+                            let mut out = gst::Buffer::from_mut_slice(combined);
+                            {
+                                let out_ref = out.make_mut();
+                                out_ref.set_pts(buffer.pts());
+                                out_ref.set_dts(buffer.dts());
+                            }
+                            probe_info.data = Some(gst::PadProbeData::Buffer(out));
+                            return gst::PadProbeReturn::Ok;
+                        };
                         let remb = build_remb(sender_ssrc, &ssrcs, kbps * 1000);
                         // Logged once on the first RTCP we get to piggyback on. Absence of this
                         // line means rtpbin is emitting no RTCP at all, which is a different
@@ -619,9 +700,11 @@ fn main() {
                                     .collect::<Vec<_>>()
                             );
                         }
-                        let mut combined = Vec::with_capacity(existing.len() + remb.len());
+                        let mut combined =
+                            Vec::with_capacity(existing.len() + remb.len() + extra.len());
                         combined.extend_from_slice(existing);
                         combined.extend_from_slice(&remb);
+                        combined.extend_from_slice(&extra);
                         drop(map);
 
                         let mut out = gst::Buffer::from_mut_slice(combined);
@@ -719,23 +802,25 @@ fn main() {
         let observed_ssrcs = Arc::clone(&observed_ssrcs_for_probe);
         pad.add_probe(PadProbeType::BUFFER, move |pad, probe_info| {
             // Does this packet prove the stream carries media? See rtp_carries_media.
-            let media_evidence = match probe_info.data {
+            let (media_evidence, packet_ssrc) = match probe_info.data {
                 Some(gst::PadProbeData::Buffer(ref buffer)) => buffer
                     .map_readable()
                     .ok()
                     .map(|map| {
                         let bytes = map.as_slice();
-                        // Recorded here because this probe already has the header mapped. Only used
-                        // to populate the REMB report; SMB reads the bitrate regardless of the list.
-                        if bytes.len() >= 12 {
-                            observed_ssrcs.lock().unwrap().insert(u32::from_be_bytes([
-                                bytes[8], bytes[9], bytes[10], bytes[11],
-                            ]));
+                        let ssrc = (bytes.len() >= 12).then(|| {
+                            u32::from_be_bytes([bytes[8], bytes[9], bytes[10], bytes[11]])
+                        });
+                        // Recorded here because this probe already has the header mapped. Used
+                        // to populate the REMB report (SMB reads the bitrate regardless of the
+                        // list) and, per pad, to name the SSRC in a keyframe request.
+                        if let Some(ssrc) = ssrc {
+                            observed_ssrcs.lock().unwrap().insert(ssrc);
                         }
-                        rtp_carries_media(bytes)
+                        (rtp_carries_media(bytes), ssrc)
                     })
-                    .unwrap_or(false),
-                _ => false,
+                    .unwrap_or((false, None)),
+                _ => (false, None),
             };
 
             let Some(caps) = pad.current_caps() else {
@@ -844,6 +929,7 @@ fn main() {
                         let verdict = video_selector.lock().unwrap().on_buffer(
                             &pad_name,
                             media_evidence,
+                            packet_ssrc,
                             Instant::now(),
                         );
                         match verdict {
@@ -1202,11 +1288,11 @@ mod tests {
         let mut sel = VideoSelector::default();
         let t0 = Instant::now();
         assert_eq!(
-            sel.on_buffer("video_src_0", true, t0),
+            sel.on_buffer("video_src_0", true, Some(4096), t0),
             VideoVerdict::Activate { previous: None }
         );
         assert_eq!(
-            sel.on_buffer("video_src_0", true, ms(t0, 20)),
+            sel.on_buffer("video_src_0", true, Some(4096), ms(t0, 20)),
             VideoVerdict::Pass
         );
     }
@@ -1215,14 +1301,17 @@ mod tests {
     fn padding_only_track_never_takes_over() {
         let mut sel = VideoSelector::default();
         let t0 = Instant::now();
-        assert_eq!(sel.on_buffer("video_src_9", false, t0), VideoVerdict::Drop);
         assert_eq!(
-            sel.on_buffer("video_src_0", true, ms(t0, 10)),
+            sel.on_buffer("video_src_9", false, Some(4105), t0),
+            VideoVerdict::Drop
+        );
+        assert_eq!(
+            sel.on_buffer("video_src_0", true, Some(4096), ms(t0, 10)),
             VideoVerdict::Activate { previous: None }
         );
         // Long after the real track went quiet, padding alone still does not win.
         assert_eq!(
-            sel.on_buffer("video_src_9", false, ms(t0, 60_000)),
+            sel.on_buffer("video_src_9", false, Some(4105), ms(t0, 60_000)),
             VideoVerdict::Drop
         );
     }
@@ -1231,14 +1320,14 @@ mod tests {
     fn second_track_is_dropped_while_the_first_is_alive() {
         let mut sel = VideoSelector::default();
         let t0 = Instant::now();
-        sel.on_buffer("video_src_0", true, t0);
+        sel.on_buffer("video_src_0", true, Some(4096), t0);
         for i in 1..100 {
             assert_eq!(
-                sel.on_buffer("video_src_0", true, ms(t0, i * 20)),
+                sel.on_buffer("video_src_0", true, Some(4096), ms(t0, i * 20)),
                 VideoVerdict::Pass
             );
             assert_eq!(
-                sel.on_buffer("video_src_2", true, ms(t0, i * 20 + 5)),
+                sel.on_buffer("video_src_2", true, Some(4098), ms(t0, i * 20 + 5)),
                 VideoVerdict::Drop
             );
         }
@@ -1249,24 +1338,24 @@ mod tests {
         // The freeze this fixes: the SFU moves the camera to a new SSRC, the old pad goes silent.
         let mut sel = VideoSelector::default();
         let t0 = Instant::now();
-        sel.on_buffer("video_src_0", true, t0);
+        sel.on_buffer("video_src_0", true, Some(4096), t0);
         assert_eq!(
-            sel.on_buffer("video_src_2", true, ms(t0, 999)),
+            sel.on_buffer("video_src_2", true, Some(4098), ms(t0, 999)),
             VideoVerdict::Drop
         );
         assert_eq!(
-            sel.on_buffer("video_src_2", true, ms(t0, 1000)),
+            sel.on_buffer("video_src_2", true, Some(4098), ms(t0, 1000)),
             VideoVerdict::Activate {
                 previous: Some("video_src_0".into())
             }
         );
         assert_eq!(
-            sel.on_buffer("video_src_2", true, ms(t0, 1020)),
+            sel.on_buffer("video_src_2", true, Some(4098), ms(t0, 1020)),
             VideoVerdict::Pass
         );
         // The old pad coming back while the new one is alive is now the one dropped.
         assert_eq!(
-            sel.on_buffer("video_src_0", true, ms(t0, 1030)),
+            sel.on_buffer("video_src_0", true, Some(4096), ms(t0, 1030)),
             VideoVerdict::Drop
         );
     }
@@ -1275,18 +1364,50 @@ mod tests {
     fn padding_on_the_active_track_does_not_keep_it_alive() {
         let mut sel = VideoSelector::default();
         let t0 = Instant::now();
-        sel.on_buffer("video_src_0", true, t0);
+        sel.on_buffer("video_src_0", true, Some(4096), t0);
         // Still passed through, but it does not count as media.
         assert_eq!(
-            sel.on_buffer("video_src_0", false, ms(t0, 900)),
+            sel.on_buffer("video_src_0", false, Some(4096), ms(t0, 900)),
             VideoVerdict::Pass
         );
         assert_eq!(
-            sel.on_buffer("video_src_2", true, ms(t0, 1000)),
+            sel.on_buffer("video_src_2", true, Some(4098), ms(t0, 1000)),
             VideoVerdict::Activate {
                 previous: Some("video_src_0".into())
             }
         );
+    }
+
+    #[test]
+    fn keyframe_is_requested_until_the_active_track_decodes() {
+        let mut sel = VideoSelector::default();
+        let t0 = Instant::now();
+        assert_eq!(sel.keyframe_request(), None);
+        sel.on_buffer("video_src_0", true, Some(0xAAAA), t0);
+        // First track of the session: the 120s black at startup.
+        assert_eq!(sel.keyframe_request(), Some(0xAAAA));
+        sel.on_decoded_frame("video_src_0");
+        assert_eq!(sel.keyframe_request(), None);
+        // Re-slotted publisher: ask on the NEW ssrc, the one the SFU now sends on.
+        sel.on_buffer("video_src_2", true, Some(0xBBBB), ms(t0, 1500));
+        assert_eq!(sel.keyframe_request(), Some(0xBBBB));
+        sel.on_decoded_frame("video_src_2");
+        assert_eq!(sel.keyframe_request(), None);
+    }
+
+    #[test]
+    fn pli_has_the_rfc4585_layout() {
+        let p = build_pli(0x0102_0304, 0xA1B2_C3D4);
+        assert_eq!(p.len(), 12);
+        assert_eq!(p[0], 0x81, "V=2, P=0, FMT=1");
+        assert_eq!(p[1], 206, "payload-specific feedback");
+        assert_eq!(
+            u16::from_be_bytes([p[2], p[3]]),
+            2,
+            "length in words minus one"
+        );
+        assert_eq!(&p[4..8], &[1, 2, 3, 4]);
+        assert_eq!(&p[8..12], &[0xA1, 0xB2, 0xC3, 0xD4]);
     }
 
     #[test]
@@ -1301,13 +1422,13 @@ mod tests {
     fn only_the_active_track_becomes_visible() {
         let mut sel = VideoSelector::default();
         let t0 = Instant::now();
-        sel.on_buffer("video_src_0", true, t0);
+        sel.on_buffer("video_src_0", true, Some(4096), t0);
         sel.on_decoded_frame("video_src_0");
         assert_eq!(sel.shown.as_deref(), Some("video_src_0"));
         // A late frame from a track that is not active must not steal the picture.
         sel.on_decoded_frame("video_src_2");
         assert_eq!(sel.shown.as_deref(), Some("video_src_0"));
-        sel.on_buffer("video_src_2", true, ms(t0, 1500));
+        sel.on_buffer("video_src_2", true, Some(4098), ms(t0, 1500));
         // Switched, but the old picture stays up until the new track has decoded a frame.
         assert_eq!(sel.shown.as_deref(), Some("video_src_0"));
         sel.on_decoded_frame("video_src_2");
